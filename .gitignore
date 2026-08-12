@@ -1,0 +1,29 @@
+# Virtual environments
+.venv/
+venv/
+
+# Real instance configs -- secrets, never committed. Only the documented
+# examples/*.example templates belong in the repo.
+disclaude.toml
+*.toml
+!examples/*.toml.example
+!pyproject.toml
+
+# Runtime state and logs (per-instance, machine-local)
+state/
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS cruft
+.DS_Store

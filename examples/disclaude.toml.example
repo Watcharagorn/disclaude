@@ -1,0 +1,80 @@
+# disclaude instance config
+#
+# Copy this file to your own path (e.g. ~/.disclaude/config.toml for the
+# global default instance that `disclaude run` reads when --config is
+# omitted, or anywhere else if you always pass --config explicitly) and
+# fill in your own values. `disclaude check --config <path>` validates a
+# copy of this file without ever connecting to Discord.
+#
+# This file holds a bot token -- it should never be world-readable.
+# `chmod 600` it once you've filled it in.
+
+[instance]
+# A short slug naming this instance. State and log files derive from it
+# (~/.disclaude/state/<name>.json, ~/.disclaude/logs/<name>.log), and so
+# does a launchd job's label if you run this instance as a service (see
+# examples/com.disclaude.example.plist).
+#
+# "default" is reserved for the global config at ~/.disclaude/config.toml
+# -- the file disclaude reads when you omit --config. If you pass
+# --config explicitly (as every non-default instance does), `name` must
+# be something else, or `disclaude check`/`run` refuses to start. This
+# guards against two instances silently colliding on the same
+# state/log/launchd-label paths.
+name = "example"
+
+[discord]
+# Reset this once in the Discord Developer Portal (your app -> Bot tab ->
+# Reset Token) and paste it here, or set the DISCLAUDE_BOT_TOKEN
+# environment variable instead -- the env var always takes priority over
+# this field, which is handy for keeping the token out of the file
+# entirely (e.g. in a launchd EnvironmentVariables block you manage
+# separately).
+bot_token = "REPLACE_WITH_YOUR_BOT_TOKEN"
+
+# The single channel this instance listens in. With Developer Mode
+# enabled (User Settings -> Advanced), right-click the channel -> Copy
+# Channel ID. Threads created under this channel are also served; every
+# other channel is ignored outright.
+channel_id = 123456789012345678
+
+# Discord user ids allowed to talk to this instance (Developer Mode ->
+# right-click a user -> Copy User ID). Everyone else's messages are
+# dropped with one log line and no reply. With the default
+# bypassPermissions mode, anyone on this list has full local control of
+# claude.cwd -- keep this list short, and keep the server private (see
+# the README's security warning before inviting anyone).
+allowed_user_ids = [234567890123456789]
+
+[claude]
+# Absolute path to the target Claude Code project. Its CLAUDE.md,
+# .claude/settings.json, skills, hooks, and plugins all load -- the same
+# as an interactive `claude` session started in this directory.
+cwd = "/path/to/your/claude-code-project"
+
+# v1 accepts only "bypassPermissions": a turn started from a Discord
+# message has no channel to answer an interactive approval prompt, so any
+# other mode would just hang the turn forever. See the README's security
+# warning before relying on this -- everyone in allowed_user_ids gets
+# full local read/write/execute power over `cwd`, unmediated.
+permission_mode = "bypassPermissions"
+
+# Uncomment to pin a specific model; leaving it unset inherits the
+# machine's default, the same as an interactive `claude` session gets.
+# model = "claude-sonnet-4-5"
+
+# Uncomment to replace the built-in Discord-rendering system-prompt
+# append (short replies, no GitHub-flavored-markdown tables, and "state
+# your assumptions and proceed" instead of asking a clarifying question --
+# Discord threads have no interactive question UI).
+# system_prompt_append = "..."
+
+[runtime]
+# How many turns this instance runs concurrently. Each turn spawns its
+# own Claude Code engine process; raise this only if both your machine
+# and your Claude subscription's usage quota can absorb it.
+max_concurrent = 3
+
+# Uncomment to override where the thread<->session map is written.
+# Defaults to ~/.disclaude/state/<instance.name>.json.
+# state_file = "/path/to/state.json"

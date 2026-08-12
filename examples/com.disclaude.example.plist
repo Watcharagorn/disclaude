@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template for one disclaude instance (macOS).
+
+  This file is parametrized per instance -- replace every "<name>" below
+  with your instance's instance.name (the same slug that names its config
+  file and its state/log paths), and every "/path/to/..." with real
+  absolute paths, then save it as:
+
+    ~/Library/LaunchAgents/com.disclaude.<name>.plist
+
+  Running two instances (e.g. two target workspaces, two Discord servers)
+  means two separately-named copies of this file, each pointing at its
+  own config -- see the README's "Running multiple instances" section.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.disclaude.&lt;name&gt;</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/disclaude/.venv/bin/python</string>
+        <string>-m</string>
+        <string>disclaude</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>/path/to/&lt;name&gt;.toml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/path/to/logs/&lt;name&gt;.log</string>
+    <key>StandardErrorPath</key>
+    <string>/path/to/logs/&lt;name&gt;.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!--
+          Deliberately no ANTHROPIC_API_KEY here: its presence outranks
+          the machine's Claude subscription OAuth login, which would
+          silently flip every turn from subscription usage to metered API
+          credits. Do not add it to this block.
+        -->
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
+    </dict>
+</dict>
+</plist>
