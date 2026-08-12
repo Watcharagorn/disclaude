@@ -104,8 +104,21 @@ class Bridge(discord.Client):
 
         if in_configured_channel:
             thread = await message.create_thread(name=derive_thread_name(message.content))
+            logger.info(
+                "message accepted: new thread %s created from message %s (author=%s, channel=%s)",
+                thread.id,
+                message.id,
+                message.author.id,
+                channel.id,
+            )
         else:
             thread = channel
+            logger.info(
+                "message accepted: thread %s (author=%s, channel=%s)",
+                thread.id,
+                message.author.id,
+                channel.id,
+            )
 
         async with thread.typing():
             if message.attachments:
@@ -116,6 +129,9 @@ class Bridge(discord.Client):
                     for chunk in chunk_message(block):
                         if chunk:
                             await thread.send(chunk)
+                            logger.info(
+                                "chunk posted: thread=%s chars=%d", thread.id, len(chunk)
+                            )
             except EngineError as exc:
                 logger.warning("turn failed in thread %s: %s", thread.id, exc)
                 await thread.send(f"\N{WARNING SIGN} Something went wrong on that turn: {exc}")

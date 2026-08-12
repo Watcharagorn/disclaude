@@ -153,6 +153,18 @@ tail -f ~/.disclaude/logs/default.log          # look for the "READY" line
 gateway session resumes and your existing thread↔session map (in
 `~/.disclaude/state/default.json`) is unaffected.
 
+### Logging
+
+At `INFO` level (the default), each turn logs a handful of lines you can
+follow live with `tail -f`: the filter's drop/pass decision, a message
+being accepted (thread id, author id, channel id), whether its session was
+newly started or resumed (and which session id), each reply chunk posted
+(thread id + character count -- the evidence a chunk stayed under
+Discord's 2000-char cap), and the turn's completion (thread id, session
+id, duration). **Message content is never logged** -- only ids, counts,
+and timings, since these logs live on disk (`~/.disclaude/logs/<name>.log`)
+indefinitely.
+
 ## Security
 
 > [!WARNING]

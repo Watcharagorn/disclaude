@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -108,6 +109,7 @@ class Engine:
                     )
                     yield RESET_NOTICE
                 else:
+                    logger.info("session resumed: thread=%s session=%s", thread_id, resume_id)
                     async for block in self._drive(client, prompt_text, thread_id):
                         yield block
                     return
@@ -118,6 +120,7 @@ class Engine:
             except ClaudeSDKError as exc:
                 raise EngineError(f"could not start a Claude session: {exc}") from exc
 
+            logger.info("session started: new session for thread=%s", thread_id)
             async for block in self._drive(client, prompt_text, thread_id):
                 yield block
 
@@ -125,6 +128,7 @@ class Engine:
         """Run the query/response loop on an already-connected client,
         yielding text blocks and persisting the session on success.
         Always disconnects, even on failure."""
+        start = time.monotonic()
         try:
             await client.query(prompt_text)
             async for message in client.receive_response():
@@ -141,6 +145,12 @@ class Engine:
                         )
                         raise EngineError(reason)
                     self.state.set_session(thread_id, message.session_id)
+                    logger.info(
+                        "turn complete: thread=%s session=%s duration=%.2fs",
+                        thread_id,
+                        message.session_id,
+                        time.monotonic() - start,
+                    )
         except EngineError:
             raise
         except ClaudeSDKError as exc:
