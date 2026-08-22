@@ -1,6 +1,9 @@
 """Direct tests of `Bridge._handle_message`'s filter predicate -- the
 instance's entire access boundary (channel id, then author allowlist, both
-before any thread creation or Claude turn).
+before any thread creation or Claude turn) -- and of its attachment
+handling: partitioning Discord attachments into images to send and
+attachments to skip, downloading/encoding the former, and notifying about
+the latter.
 
 Needs discord.py installed (for `discord.Thread`/mock isinstance checks and
 `Bridge` itself), so this module follows `test_isolation.py`'s
@@ -8,6 +11,7 @@ skipUnless pattern: it collects cleanly under system Python (skipped) and
 runs fully under the project's venv.
 """
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,9 +20,11 @@ from unittest.mock import AsyncMock, MagicMock
 from disclaude import config as config_module
 
 try:
+    import aiohttp
     import discord
 
-    from disclaude.bridge import Bridge
+    from disclaude.bridge import Bridge, _partition_attachments
+    from disclaude.engine import ImagePart
 
     HAS_RUNTIME_DEPS = True
 except ImportError:
@@ -90,17 +96,50 @@ def make_message(*, channel, author_id, content="hello", is_bot=False, attachmen
     return message
 
 
+def make_attachment(
+    *,
+    filename="pic.png",
+    content_type="image/png",
+    size=1024,
+    width=100,
+    height=100,
+    data=b"fakepng",
+):
+    """A stand-in `discord.Attachment` -- carries the fields
+    `_partition_attachments` reads (content_type/size/width/height) plus a
+    fake `.read()` for the download step, without a real Discord CDN."""
+    att = MagicMock()
+    att.filename = filename
+    att.content_type = content_type
+    att.size = size
+    att.width = width
+    att.height = height
+    att.read = AsyncMock(return_value=data)
+    return att
+
+
+def make_http_exception(status=404, reason="Not Found", message="not found"):
+    """A real, constructible `discord.HTTPException` -- its `__init__`
+    reads `response.status`/`response.reason`, so a bare mock response
+    with those two attributes set is enough."""
+    response = MagicMock()
+    response.status = status
+    response.reason = reason
+    return discord.HTTPException(response, message)
+
+
 class FakeEngine:
     """Stands in for `engine.py`'s real `Engine` -- records the
-    (thread_id, prompt_text) each call reached it with and yields whatever
-    text blocks the test hands it, without touching the SDK or Discord."""
+    (thread_id, prompt_text, images) each call reached it with and yields
+    whatever text blocks the test hands it, without touching the SDK or
+    Discord."""
 
     def __init__(self, blocks=()):
         self.blocks = list(blocks)
         self.calls = []
 
-    async def run_turn(self, thread_id, prompt_text):
-        self.calls.append((thread_id, prompt_text))
+    async def run_turn(self, thread_id, prompt_text, images=()):
+        self.calls.append((thread_id, prompt_text, tuple(images)))
         for block in self.blocks:
             yield block
 
@@ -168,7 +207,7 @@ class BridgeFilterTests(unittest.IsolatedAsyncioTestCase):
         await bridge._handle_message(message)
 
         message.create_thread.assert_awaited_once()
-        self.assertEqual(bridge.engine.calls, [(thread.id, "hi there")])
+        self.assertEqual(bridge.engine.calls, [(thread.id, "hi there", ())])
         thread.send.assert_awaited_once_with("ack")
 
     async def test_valid_thread_reply_proceeds_to_engine_without_new_thread(self):
@@ -179,8 +218,239 @@ class BridgeFilterTests(unittest.IsolatedAsyncioTestCase):
         await bridge._handle_message(message)
 
         message.create_thread.assert_not_called()
-        self.assertEqual(bridge.engine.calls, [(thread.id, "follow up")])
+        self.assertEqual(bridge.engine.calls, [(thread.id, "follow up", ())])
         thread.send.assert_awaited_once_with("ack2")
+
+    # -- attachment handling --------------------------------------------
+
+    async def test_image_and_text_reaches_engine_with_no_notice(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000001, parent_id=CONFIGURED_CHANNEL_ID)
+        att = make_attachment(filename="pic.png", content_type="image/png", data=b"fakepng")
+        message = make_message(
+            channel=thread, author_id=ALLOWED_USER_ID, content="look at this", attachments=[att]
+        )
+
+        await bridge._handle_message(message)
+
+        self.assertEqual(len(bridge.engine.calls), 1)
+        thread_id, prompt_text, images = bridge.engine.calls[0]
+        self.assertEqual(prompt_text, "look at this")
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0].media_type, "image/png")
+        self.assertEqual(images[0].data_b64, base64.b64encode(b"fakepng").decode())
+
+        # No skipped-attachment notice among the posted messages -- only
+        # the normal reply chunk.
+        sent_texts = [c.args[0] for c in thread.send.call_args_list]
+        self.assertEqual(sent_texts, ["ack"])
+
+    async def test_non_image_attachment_is_skipped_with_notice(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000002, parent_id=CONFIGURED_CHANNEL_ID)
+        att = make_attachment(filename="archive.zip", content_type="application/zip")
+        message = make_message(
+            channel=thread, author_id=ALLOWED_USER_ID, content="see attached", attachments=[att]
+        )
+
+        await bridge._handle_message(message)
+
+        self.assertEqual(len(bridge.engine.calls), 1)
+        _, _, images = bridge.engine.calls[0]
+        self.assertEqual(images, ())
+
+        sent_texts = [c.args[0] for c in thread.send.call_args_list]
+        notice_texts = [t for t in sent_texts if "skipped" in t]
+        self.assertEqual(len(notice_texts), 1)
+        self.assertIn("archive.zip", notice_texts[0])
+
+    async def test_oversized_image_skipped_small_one_sent(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000003, parent_id=CONFIGURED_CHANNEL_ID)
+        big = make_attachment(
+            filename="huge.png", content_type="image/png", size=6 * 1024 * 1024
+        )
+        small = make_attachment(
+            filename="small.jpg", content_type="image/jpeg", size=2048, data=b"smalljpeg"
+        )
+        message = make_message(
+            channel=thread,
+            author_id=ALLOWED_USER_ID,
+            content="two files",
+            attachments=[big, small],
+        )
+
+        await bridge._handle_message(message)
+
+        _, _, images = bridge.engine.calls[0]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0].media_type, "image/jpeg")
+
+        sent_texts = [c.args[0] for c in thread.send.call_args_list]
+        notice_texts = [t for t in sent_texts if "skipped" in t]
+        self.assertEqual(len(notice_texts), 1)
+        self.assertIn("huge.png", notice_texts[0])
+        self.assertNotIn("small.jpg", notice_texts[0])
+
+    async def test_over_long_edge_image_is_skipped(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000004, parent_id=CONFIGURED_CHANNEL_ID)
+        att = make_attachment(filename="wide.png", content_type="image/png", width=9000)
+        message = make_message(
+            channel=thread, author_id=ALLOWED_USER_ID, content="check this", attachments=[att]
+        )
+
+        await bridge._handle_message(message)
+
+        _, _, images = bridge.engine.calls[0]
+        self.assertEqual(images, ())
+        sent_texts = [c.args[0] for c in thread.send.call_args_list]
+        self.assertTrue(any("skipped" in t and "wide.png" in t for t in sent_texts))
+
+    async def test_download_failure_http_exception_degrades_gracefully(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000005, parent_id=CONFIGURED_CHANNEL_ID)
+        att = make_attachment(filename="pic.png", content_type="image/png")
+        att.read = AsyncMock(side_effect=make_http_exception())
+        message = make_message(
+            channel=thread, author_id=ALLOWED_USER_ID, content="hello there", attachments=[att]
+        )
+
+        await bridge._handle_message(message)
+
+        self.assertEqual(len(bridge.engine.calls), 1)
+        _, prompt_text, images = bridge.engine.calls[0]
+        self.assertEqual(prompt_text, "hello there")
+        self.assertEqual(images, ())
+
+        sent_texts = [c.args[0] for c in thread.send.call_args_list]
+        self.assertTrue(any("skipped" in t for t in sent_texts))
+        self.assertIn("ack", sent_texts)
+
+    async def test_download_failure_aiohttp_client_error_degrades_gracefully(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000006, parent_id=CONFIGURED_CHANNEL_ID)
+        att = make_attachment(filename="pic.png", content_type="image/png")
+        att.read = AsyncMock(side_effect=aiohttp.ClientError("connection reset"))
+        message = make_message(
+            channel=thread, author_id=ALLOWED_USER_ID, content="hello again", attachments=[att]
+        )
+
+        await bridge._handle_message(message)
+
+        self.assertEqual(len(bridge.engine.calls), 1)
+        _, prompt_text, images = bridge.engine.calls[0]
+        self.assertEqual(prompt_text, "hello again")
+        self.assertEqual(images, ())
+
+        sent_texts = [c.args[0] for c in thread.send.call_args_list]
+        self.assertTrue(any("skipped" in t for t in sent_texts))
+        self.assertIn("ack", sent_texts)
+
+    async def test_image_only_message_reaches_engine(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000007, parent_id=CONFIGURED_CHANNEL_ID)
+        att = make_attachment(filename="pic.png", content_type="image/png", data=b"fakepng")
+        message = make_message(
+            channel=thread, author_id=ALLOWED_USER_ID, content="", attachments=[att]
+        )
+
+        await bridge._handle_message(message)
+
+        self.assertEqual(len(bridge.engine.calls), 1)
+        thread_id, prompt_text, images = bridge.engine.calls[0]
+        self.assertEqual(prompt_text, "")
+        self.assertEqual(len(images), 1)
+        self.assertIsInstance(images[0], ImagePart)
+
+    async def test_image_only_all_skipped_does_not_call_engine(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000008, parent_id=CONFIGURED_CHANNEL_ID)
+        att = make_attachment(filename="archive.zip", content_type="application/zip")
+        message = make_message(
+            channel=thread, author_id=ALLOWED_USER_ID, content="", attachments=[att]
+        )
+
+        await bridge._handle_message(message)
+
+        self.assertEqual(bridge.engine.calls, [])
+        sent_texts = [c.args[0] for c in thread.send.call_args_list]
+        self.assertTrue(any("skipped" in t for t in sent_texts))
+
+    async def test_follow_up_in_existing_thread_with_image_reaches_engine(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000009, parent_id=CONFIGURED_CHANNEL_ID)
+        att = make_attachment(filename="pic.png", content_type="image/png", data=b"fakepng")
+        message = make_message(
+            channel=thread,
+            author_id=ALLOWED_USER_ID,
+            content="another one",
+            attachments=[att],
+        )
+
+        await bridge._handle_message(message)
+
+        message.create_thread.assert_not_called()
+        self.assertEqual(len(bridge.engine.calls), 1)
+        thread_id, prompt_text, images = bridge.engine.calls[0]
+        self.assertEqual(thread_id, thread.id)
+        self.assertEqual(len(images), 1)
+
+    async def test_long_notice_is_chunked_under_discord_limit(self):
+        bridge = self.make_bridge(blocks=["ack"])
+        thread = make_thread(thread_id=100000000000000010, parent_id=CONFIGURED_CHANNEL_ID)
+        attachments = [
+            make_attachment(
+                filename=f"a-very-long-filename-that-eats-space-{i:03d}-" + "x" * 150 + ".zip",
+                content_type="application/zip",
+            )
+            for i in range(10)
+        ]
+        message = make_message(
+            channel=thread,
+            author_id=ALLOWED_USER_ID,
+            content="many bad files",
+            attachments=attachments,
+        )
+
+        await bridge._handle_message(message)
+
+        for call in thread.send.call_args_list:
+            (text,) = call.args
+            self.assertLessEqual(len(text), 2000)
+
+
+@unittest.skipUnless(
+    HAS_RUNTIME_DEPS, "requires the venv (discord.py + claude-agent-sdk installed)"
+)
+class PartitionAttachmentsTests(unittest.TestCase):
+    """Direct, Bridge-free tests of the pure partition helper."""
+
+    def test_over_cap_attachments_split_ten_and_one(self):
+        attachments = [make_attachment(filename=f"img{i}.png") for i in range(11)]
+
+        usable, skipped = _partition_attachments(attachments)
+
+        self.assertEqual(len(usable), 10)
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("limit", skipped[0][1])
+
+    def test_none_content_type_is_skipped(self):
+        att = make_attachment(content_type=None)
+
+        usable, skipped = _partition_attachments([att])
+
+        self.assertEqual(usable, [])
+        self.assertEqual(len(skipped), 1)
+
+    def test_parameterized_content_type_is_normalized(self):
+        att = make_attachment(content_type="image/png; foo=bar")
+
+        usable, skipped = _partition_attachments([att])
+
+        self.assertEqual(len(usable), 1)
+        self.assertEqual(usable[0][1], "image/png")
+        self.assertEqual(skipped, [])
 
 
 if __name__ == "__main__":

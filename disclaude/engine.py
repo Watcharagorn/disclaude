@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -41,6 +42,53 @@ class EngineError(Exception):
     """A turn failed outright (not a resumable-session hiccup, which is
     handled internally). Carries a short, human-readable reason; bridge.py
     decides how that reason is presented in Discord."""
+
+
+@dataclass(frozen=True)
+class ImagePart:
+    """One image to attach to a turn: already-downloaded, already-base64
+    bytes plus the media type Claude needs to decode them. bridge.py builds
+    these from Discord attachments; this module never touches Discord, so
+    it carries no filename -- engine.py doesn't need one, and it keeps
+    filenames out of any temptation to log them here."""
+
+    media_type: str
+    data_b64: str
+
+
+def build_user_message(prompt_text, images):
+    """Build the stream-json user-message dict `client.query()` expects
+    when a turn carries images, mirroring the shape the SDK itself builds
+    for a plain string prompt (`ClaudeSDKClient.query`,
+    claude_agent_sdk/client.py) but with image content blocks ahead of the
+    text block, per Anthropic's vision guidance (image first, question
+    after). `session_id` is deliberately omitted -- `query()` backfills it
+    with "default" when missing, identical to the plain-string path; which
+    Claude session this resumes is controlled entirely by the CLI
+    `--resume` flag set from `ClaudeAgentOptions`, never by this field.
+    """
+    content = [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": image.data_b64,
+            },
+        }
+        for image in images
+    ]
+    if prompt_text:
+        content.append({"type": "text", "text": prompt_text})
+    return {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": None,
+    }
+
+
+async def _single_message_stream(message):
+    yield message
 
 
 class Engine:
@@ -73,7 +121,7 @@ class Engine:
             resume=resume_session_id,
         )
 
-    async def run_turn(self, thread_id, prompt_text):
+    async def run_turn(self, thread_id, prompt_text, images=()):
         """Run one Claude turn bound to `thread_id`, yielding each
         completed assistant text block as it arrives.
 
@@ -110,7 +158,7 @@ class Engine:
                     yield RESET_NOTICE
                 else:
                     logger.info("session resumed: thread=%s session=%s", thread_id, resume_id)
-                    async for block in self._drive(client, prompt_text, thread_id):
+                    async for block in self._drive(client, prompt_text, thread_id, images):
                         yield block
                     return
 
@@ -121,16 +169,19 @@ class Engine:
                 raise EngineError(f"could not start a Claude session: {exc}") from exc
 
             logger.info("session started: new session for thread=%s", thread_id)
-            async for block in self._drive(client, prompt_text, thread_id):
+            async for block in self._drive(client, prompt_text, thread_id, images):
                 yield block
 
-    async def _drive(self, client, prompt_text, thread_id):
+    async def _drive(self, client, prompt_text, thread_id, images):
         """Run the query/response loop on an already-connected client,
         yielding text blocks and persisting the session on success.
         Always disconnects, even on failure."""
         start = time.monotonic()
         try:
-            await client.query(prompt_text)
+            if images:
+                await client.query(_single_message_stream(build_user_message(prompt_text, images)))
+            else:
+                await client.query(prompt_text)
             async for message in client.receive_response():
                 if isinstance(message, AssistantMessage):
                     for block in message.content:

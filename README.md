@@ -158,7 +158,9 @@ gateway session resumes and your existing thread↔session map (in
 At `INFO` level (the default), each turn logs a handful of lines you can
 follow live with `tail -f`: the filter's drop/pass decision, a message
 being accepted (thread id, author id, channel id), whether its session was
-newly started or resumed (and which session id), each reply chunk posted
+newly started or resumed (and which session id), a message's attachments
+(how many images were sent vs. skipped, total raw bytes, media types --
+when the message had attachments at all), each reply chunk posted
 (thread id + character count -- the evidence a chunk stayed under
 Discord's 2000-char cap), and the turn's completion (thread id, session
 id, duration). **Message content is never logged** -- only ids, counts,
@@ -199,9 +201,18 @@ Given that, treat an allowlisted Discord account like a credential:
   Discord's own gateway-resume window (a few minutes) has elapsed, is
   simply never seen. If you need a message answered, wait for the
   `READY` line in the log (or the `launchctl list` PID) before sending it.
-- **Attachments are ignored.** v1 is text-only. A message with an
-  attachment gets a one-line "ignored" notice in the reply; image support
-  is a follow-up.
+- **Images only, up to 10 per message.** PNG, JPEG, GIF, and WebP
+  attachments up to 5 MB and 8000 px on the long edge are sent inline to
+  Claude (animated GIFs contribute only their first frame). Anything else
+  -- other file types, oversized images, more than 10 in one message -- is
+  skipped, with one reply naming which attachments were skipped and why.
+  Images arriving by routes other than a plain attachment aren't seen at
+  all: stickers, forwarded-message snapshots, and link-preview embeds are
+  ignored, and voice messages are skipped as non-images.
+- **Attachment downloads aren't concurrency-limited.** Unlike Claude
+  turns, fetching and base64-encoding attachments happens before
+  `runtime.max_concurrent` is acquired -- a worst-case message (10 x 5 MB
+  images) transiently holds on the order of 120 MB in memory.
 - **No table rendering.** Discord doesn't render GitHub-flavored markdown
   tables. The built-in system-prompt append tells Claude to avoid them, so
   replies use lists or plain text instead.

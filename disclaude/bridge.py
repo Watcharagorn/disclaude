@@ -11,14 +11,27 @@ without a Discord connection at all.
 
 from __future__ import annotations
 
+import base64
 import logging
 
+import aiohttp
 import discord
 
 from .chunker import chunk_message, derive_thread_name
-from .engine import Engine, EngineError
+from .engine import Engine, EngineError, ImagePart
 
 logger = logging.getLogger("disclaude.bridge")
+
+# Anthropic API constants (not per-instance preferences, so not config
+# knobs): images larger than this, or with a long edge over this, are
+# skipped client-side rather than sent -- the API doesn't reliably reject
+# either condition with a visible error (verified during Step 0's de-risk:
+# an oversized-edge image is silently downscaled, not rejected), so
+# catching them here is the only way to give the user a clear reason.
+IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_EDGE_PX = 8000
+MAX_IMAGES_PER_MESSAGE = 10  # matches Discord's own per-message attachment cap
 
 
 def _build_intents():
@@ -33,11 +46,48 @@ def _build_intents():
     return intents
 
 
-def _attachment_notice(attachments):
-    n = len(attachments)
+def _partition_attachments(attachments):
+    """Split incoming attachments into (usable, skipped):
+    `usable` is `[(attachment, media_type)]` for attachments to fetch and
+    send; `skipped` is `[(attachment, reason)]` for everything else. Pure
+    -- does no I/O, only reads fields Discord already sent with the
+    message (`content_type`, `size`, `width`, `height`).
+
+    A `content_type` of `None`, or one outside the four types Claude
+    accepts, is skipped as non-image; a parameterized type (e.g.
+    "image/png; foo=bar") is normalized by splitting on ";" first. Missing
+    `width`/`height` (a mislabeled file Discord couldn't introspect) is let
+    through -- the size cap still bounds it, and a file the API genuinely
+    can't decode surfaces as Claude saying so in its reply, not a crash
+    (verified during Step 0's de-risk).
+    """
+    images, skipped = [], []
+    for att in attachments:
+        media_type = (att.content_type or "").split(";")[0].strip().lower()
+        if media_type not in IMAGE_MEDIA_TYPES:
+            skipped.append((att, "not an image type Claude accepts"))
+        elif att.size > MAX_IMAGE_BYTES:
+            skipped.append((att, "larger than 5 MB"))
+        elif max(att.width or 0, att.height or 0) > MAX_IMAGE_EDGE_PX:
+            skipped.append((att, "longer than 8000 px on one side"))
+        elif len(images) >= MAX_IMAGES_PER_MESSAGE:
+            skipped.append((att, f"over the {MAX_IMAGES_PER_MESSAGE}-image limit"))
+        else:
+            images.append((att, media_type))
+    return images, skipped
+
+
+def _attachment_notice(skipped, sent_count):
+    """One combined italic notice naming every skipped attachment and why,
+    or `None` when nothing was skipped. Images that go through get no
+    notice -- Claude's reply referencing them is the evidence."""
+    if not skipped:
+        return None
+    parts = ", ".join(f"`{att.filename}` ({reason})" for att, reason in skipped)
+    n = len(skipped)
     noun = "attachment" if n == 1 else "attachments"
-    pronoun = "it was" if n == 1 else "they were"
-    return f"_(this message had {n} {noun} -- disclaude v1 is text-only, so {pronoun} ignored)_"
+    tail = " -- the rest were sent to Claude" if sent_count > 0 else ""
+    return f"_({n} {noun} skipped: {parts}{tail})_"
 
 
 class Bridge(discord.Client):
@@ -121,11 +171,51 @@ class Bridge(discord.Client):
             )
 
         async with thread.typing():
+            image_parts, skipped = [], []
+            raw_bytes_total = 0
             if message.attachments:
-                await thread.send(_attachment_notice(message.attachments))
+                usable, skipped = _partition_attachments(message.attachments)
+                for att, media_type in usable:
+                    try:
+                        data = await att.read()
+                    except (discord.HTTPException, aiohttp.ClientError, OSError):
+                        skipped.append((att, "couldn't be downloaded from Discord"))
+                        continue
+                    if len(data) > MAX_IMAGE_BYTES:  # trust-but-verify Discord's size field
+                        skipped.append((att, "larger than 5 MB"))
+                        continue
+                    raw_bytes_total += len(data)
+                    image_parts.append(
+                        ImagePart(
+                            media_type=media_type,
+                            data_b64=base64.b64encode(data).decode("ascii"),
+                        )
+                    )
+
+                notice = _attachment_notice(skipped, len(image_parts))
+                if notice:
+                    for chunk in chunk_message(notice):
+                        await thread.send(chunk)
+
+                logger.info(
+                    "attachments: thread=%s images_sent=%d skipped=%d bytes=%d types=%s",
+                    thread.id,
+                    len(image_parts),
+                    len(skipped),
+                    raw_bytes_total,
+                    ",".join(sorted({p.media_type for p in image_parts})) or "-",
+                )
+
+                if not message.content and not image_parts:
+                    # Image-only message, everything skipped: the notice
+                    # above already explains why -- don't burn a Claude
+                    # turn on an empty message.
+                    return
 
             try:
-                async for block in self.engine.run_turn(thread.id, message.content):
+                async for block in self.engine.run_turn(
+                    thread.id, message.content, images=tuple(image_parts)
+                ):
                     for chunk in chunk_message(block):
                         if chunk:
                             await thread.send(chunk)
